@@ -8,12 +8,18 @@ import {
   loadSession,
 } from "@/features/arrangement";
 import { createMixer } from "@/features/mixer";
-import type { NoteInput, Instrument, Session } from "@/shared/types";
+import {
+  createQuantizer,
+  type QuantizeSnapshot,
+  type Quantizer,
+} from "@/features/quantizer";
+import type { NoteInput, Instrument, Session, Track } from "@/shared/types";
 export function createStudio(notify: () => void) {
   const engine = createEngine(),
     transport = createTransport(),
     recorder = createRecorder(),
     arrangement = createArrangement(),
+    quantizer = createQuantizer(arrangement),
     mixer = createMixer();
   const active = new Set<string>();
   let message = "欢迎来到夜航。戴上耳机，试着敲下第一拍。",
@@ -44,6 +50,7 @@ export function createStudio(notify: () => void) {
     epoch++;
     transport.stop();
     recorder.cancel();
+    quantizer.close();
     cancelVoices();
     notify();
   };
@@ -73,6 +80,36 @@ export function createStudio(notify: () => void) {
       feedback("声音启动失败，请再次点击播放");
     }
   };
+  /**
+   * 试听阶段不改正式内容：把量化预览覆盖到工作台轨道的播放副本上，
+   * 预览与播放使用同一份选择与同一份结果。
+   */
+  const playbackTracks = (): Track[] => {
+    const tracks = arrangement.forPlayback();
+    const q = quantizer.openId;
+    if (!q) return tracks;
+    const length = transport.view(now()).beats;
+    const snap = quantizer.snapshot(length);
+    const preview = new Map(snap.previews.map((p) => [p.note.id, p.preview]));
+    return tracks.map((t) =>
+      t.id !== q
+        ? t
+        : {
+            ...t,
+            notes: t.notes.map((n) => {
+              const p = preview.get(n.id);
+              return p ? { ...n, beat: p.beat, duration: p.duration } : n;
+            }),
+          },
+    );
+  };
+  /**
+   * 撤销旧事件：播放中预览变化或应用 / 恢复 / 取消时调用，
+   * 尚未发声的旧事件不再响，已经发声的失效长音立即释放。
+   */
+  const revokeTrack = (trackId: string, noteIds?: ReadonlySet<string>) => {
+    engine.revokeNotes({ trackId, noteIds });
+  };
   const tick = () => {
     const time = now(),
       view = transport.view(time);
@@ -88,7 +125,7 @@ export function createStudio(notify: () => void) {
     const window = transport.window(time, ceiling);
     if (window)
       scheduleWindow(
-        arrangement.forPlayback(),
+        playbackTracks(),
         window.from,
         window.to,
         view.beats,
@@ -138,6 +175,7 @@ export function createStudio(notify: () => void) {
     const valid = arrangement.restore(session);
     transport.configure(valid.bpm, valid.beats);
     mixer.restore(valid.channels, valid.master);
+    quantizer.close();
     notify();
   };
   const timer = window.setInterval(() => {
@@ -163,11 +201,21 @@ export function createStudio(notify: () => void) {
   window.addEventListener("blur", blur);
   return {
     view() {
+      const beats = transport.view(now()).beats;
+      const qSnap: QuantizeSnapshot | null = quantizer.isOpen()
+        ? quantizer.snapshot(beats)
+        : null;
       return {
         transport: transport.view(now()),
         arrangement: arrangement.snapshot(),
         selected: arrangement.selected(),
         recorder: recorder.snapshot(),
+        quantizer: qSnap,
+        /** 录音正在进行的轨道拒绝应用量化。 */
+        quantizerBusy:
+          qSnap !== null &&
+          recorder.snapshot().status !== "idle" &&
+          recorder.snapshot().trackId === qSnap.trackId,
         mixer: mixer.snapshot(),
         active: new Set(active),
         message,
@@ -181,7 +229,10 @@ export function createStudio(notify: () => void) {
     configure(bpm: number, beats: number) {
       stop();
       transport.configure(bpm, beats);
-      arrangement.resizeLoop(transport.view(now()).beats);
+      const next = transport.view(now()).beats;
+      arrangement.resizeLoop(next);
+      quantizer.setLoopLength(next);
+      quantizer.refresh();
       feedback("速度或长度变更：播放回到起点；缩短时移除范围外音符。");
     },
     add(kind: Instrument) {
@@ -192,6 +243,10 @@ export function createStudio(notify: () => void) {
     },
     select(id: string) {
       if (recorder.snapshot().status !== "idle") return;
+      if (quantizer.isOpen() && quantizer.openId !== id) {
+        feedback("请先关闭量化工作台，再切换到其他轨道。");
+        return;
+      }
       engine.releaseHeld();
       active.clear();
       arrangement.select(id);
@@ -203,6 +258,7 @@ export function createStudio(notify: () => void) {
         if (selected) {
           stop();
           arrangement.remove(selected.id);
+          quantizer.close();
           syncMixer();
         }
       });
@@ -213,12 +269,17 @@ export function createStudio(notify: () => void) {
         if (t) {
           stop();
           arrangement.clear(t.id);
+          quantizer.close();
         }
       });
     },
     async record() {
       const selected = arrangement.selected();
       if (!selected) return;
+      if (quantizer.isOpen()) {
+        feedback("该轨道正在量化预览，请先关闭量化工作台再录音。");
+        return;
+      }
       const token = ++epoch;
       try {
         if (!(await unlock()) || token !== epoch) return;
@@ -243,6 +304,94 @@ export function createStudio(notify: () => void) {
     grid(n: number) {
       recorder.grid(n);
       notify();
+    },
+    openQuantizer() {
+      guard(() => {
+        const t = arrangement.selected();
+        if (!t) throw new Error("请先选择一条轨道");
+        if (!t.notes.length) throw new Error("该轨道还没有音符可量化");
+        if (recorder.snapshot().status !== "idle")
+          throw new Error("录音进行中，无法打开量化工作台");
+        quantizer.open(t.id, transport.view(now()).beats);
+        message = "量化工作台已打开：调整参数只生成预览，应用前不会改动音符。";
+      });
+    },
+    closeQuantizer() {
+      const trackId = quantizer.openId;
+      quantizer.close();
+      // 取消预览：撤销该轨道尚未发声的旧事件并释放失效长音，下一节拍恢复正式内容。
+      if (trackId) revokeTrack(trackId);
+      feedback("已退出量化预览，正式内容未做任何改动。");
+    },
+    updateQuantizer(patch: Parameters<Quantizer["update"]>[0]) {
+      const trackId = quantizer.openId;
+      if (!trackId) return;
+      quantizer.update(patch);
+      // 预览变了：播放中立刻撤销旧排期，下一窗口按新预览重新发声，不能靠暂停回避。
+      revokeTrack(trackId);
+      notify();
+    },
+    selectQuantizerNote(noteId: string) {
+      if (!quantizer.isOpen()) return;
+      const trackId = quantizer.openId!;
+      quantizer.toggleNote(noteId);
+      revokeTrack(trackId);
+      notify();
+    },
+    quantizerSelectAll() {
+      const trackId = quantizer.openId;
+      if (!trackId) return;
+      quantizer.selectAll();
+      revokeTrack(trackId);
+      notify();
+    },
+    quantizerSelectNone() {
+      const trackId = quantizer.openId;
+      if (!trackId) return;
+      quantizer.selectNone();
+      revokeTrack(trackId);
+      notify();
+    },
+    applyQuantizer() {
+      guard(() => {
+        const snap = recorder.snapshot();
+        const trackId = quantizer.openId;
+        if (!trackId) throw new Error("量化工作台未打开");
+        // 录音正在进行的轨道拒绝应用。
+        if (snap.status !== "idle" && snap.trackId === trackId)
+          throw new Error("该轨道正在录音，拒绝应用量化");
+        const before = new Map(
+          arrangement
+            .snapshot()
+            .tracks.find((t) => t.id === trackId)!
+            .notes.map((n) => [n.id, n]),
+        );
+        quantizer.apply(transport.view(now()).beats);
+        // 播放中确认：撤销尚未发声的旧事件、释放已失效的长音，随后按新结果排期。
+        revokeTrack(trackId);
+        quantizer.refresh();
+        const moved = quantizer
+          .snapshot(transport.view(now()).beats)
+          .previews.filter((p) => {
+            const old = before.get(p.note.id);
+            return (
+              old &&
+              (Math.abs(old.beat - p.note.beat) > 1e-9 ||
+                Math.abs(old.duration - p.note.duration) > 1e-9)
+            );
+          }).length;
+        message = `已应用到选中音符 · ${moved} 个音符位置更新，原始演奏已保留可随时恢复。`;
+      });
+    },
+    restoreQuantizer() {
+      guard(() => {
+        const trackId = quantizer.openId;
+        if (!trackId) throw new Error("量化工作台未打开");
+        quantizer.restoreSelected();
+        revokeTrack(trackId);
+        quantizer.refresh();
+        feedback("选中音符已恢复为原始演奏；原始基准仍保留，可继续预览其他网格。");
+      });
     },
     volume(id: string, n: number) {
       mixer.volume(id, n);

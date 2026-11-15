@@ -15,6 +15,7 @@ export function scheduleWindow(
         play({
           trackId: track.id,
           instrument: track.instrument,
+          noteId: note.id,
           pitch: note.pitch,
           velocity: note.velocity,
           duration: (note.duration * 60) / bpm,

@@ -48,7 +48,11 @@ export function validateSession(raw: unknown): Session {
         !Number.isInteger(n.pitch) ||
         !finite(n.beat, 0, (raw.beats as number) - 0.000001) ||
         !finite(n.duration, 0.01, raw.beats as number) ||
-        !finite(n.velocity, 0.01, 1)
+        !finite(n.velocity, 0.01, 1) ||
+        (n.original !== undefined &&
+          (!object(n.original) ||
+            !finite(n.original.beat, 0, (raw.beats as number) - 0.000001) ||
+            !finite(n.original.duration, 0.01, raw.beats as number)))
       )
         throw new Error("音符数据无效");
       noteIds.add(n.id);

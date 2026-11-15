@@ -3,6 +3,7 @@ import { TransportBar, BeatLights } from "@/features/transport";
 import { Pads, Keyboard } from "@/features/instruments";
 import { Timeline, TrackActions } from "@/features/arrangement";
 import { RecordControls, RecordingStatus } from "@/features/recorder";
+import { QuantizePanel } from "@/features/quantizer";
 import { MixerPanel } from "@/features/mixer";
 export function App() {
   const s = useStudio();
@@ -75,9 +76,11 @@ export function App() {
               selected={v.selected}
               count={v.arrangement.tracks.length}
               locked={locked}
+              quantizing={v.quantizer?.open ?? false}
               add={s.add}
               clear={s.clear}
               remove={s.remove}
+              openQuantizer={s.openQuantizer}
             />
             <Timeline
               tracks={v.arrangement.tracks}
@@ -85,8 +88,22 @@ export function App() {
               position={v.transport.position}
               beats={v.transport.beats}
               draft={v.recorder.draft}
+              quantizer={v.quantizer}
               select={s.select}
+              toggleNote={(_trackId, noteId) => s.selectQuantizerNote(noteId)}
             />
+            {v.quantizer?.open && (
+              <QuantizePanel
+                state={v.quantizer}
+                busy={v.quantizerBusy}
+                update={s.updateQuantizer}
+                apply={s.applyQuantizer}
+                restore={s.restoreQuantizer}
+                selectAll={s.quantizerSelectAll}
+                selectNone={s.quantizerSelectNone}
+                close={s.closeQuantizer}
+              />
+            )}
             <div className="arrangement-footer">
               <span>
                 <i className="color-dot" />{" "}
